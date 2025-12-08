@@ -1,6 +1,11 @@
 # Taken from https://github.com/KellerJordan/cifar10-airbench/blob/master/legacy/airbench94.py
-# Modified to include Adaptive Selective Layer Freezing
-# Experiments with gradient-based and fixed-epoch freezing strategies
+# Uncompiled variant of airbench94_compiled.py
+# 3.83s runtime on an A100; 0.36 PFLOPs.
+# Evidence: 94.01 average accuracy in n=1000 runs.
+#
+# We recorded the runtime of 3.83 seconds on an NVIDIA A100-SXM4-80GB with the following nvidia-smi:
+# NVIDIA-SMI 515.105.01   Driver Version: 515.105.01   CUDA Version: 11.7
+# torch.__version__ == '2.1.2+cu118'
 
 #############################################
 #            Setup/Hyperparameters          #
@@ -19,17 +24,28 @@ import torchvision.transforms as T
 
 torch.backends.cudnn.benchmark = True
 
-# Extended hyperparameters to include freezing configuration
+# We express the main training hyperparameters (batch size, learning rate, momentum, and weight decay)
+# in decoupled form, so that each one can be tuned independently. This accomplishes the following:
+# * Assuming time-constant gradients, the average step size is decoupled from everything but the lr.
+# * The size of the weight decay update is decoupled from everything but the wd.
+# In constrast, normally when we increase the (Nesterov) momentum, this also scales up the step size
+# proportionally to 1 + 1 / (1 - momentum), meaning we cannot change momentum without having to re-tune
+# the learning rate. Similarly, normally when we increase the learning rate this also increases the size
+# of the weight decay, requiring a proportional decrease in the wd to maintain the same decay strength.
+#
+# The practical impact is that hyperparameter tuning is faster, since this parametrization allows each
+# one to be tuned independently. See https://myrtle.ai/learn/how-to-train-your-resnet-5-hyperparameters/.
+
 hyp = {
     'opt': {
         'train_epochs': 9.9,
         'batch_size': 1024,
-        'lr': 11.5,
+        'lr': 11.5,                 # learning rate per 1024 examples
         'momentum': 0.85,
-        'weight_decay': 0.0153,
-        'bias_scaler': 64.0,
+        'weight_decay': 0.0153,     # weight decay per 1024 examples (decoupled from learning rate)
+        'bias_scaler': 64.0,        # scales up learning rate (but not weight decay) for BatchNorm biases
         'label_smoothing': 0.2,
-        'whiten_bias_epochs': 3,
+        'whiten_bias_epochs': 3,    # how many epochs to train the whitening layer bias before freezing
     },
     'aug': {
         'flip': True,
@@ -43,24 +59,7 @@ hyp = {
         },
         'batchnorm_momentum': 0.6,
         'scaling_factor': 1/9,
-        'tta_level': 2,
-    },
-    'freeze': {
-        'enabled': True,  # Toggle selective layer freezing
-        'strategy': 'gradient',  # 'gradient', 'fixed', 'hybrid', 'none'
-        'gradient_threshold': {
-            'block1': 5e-4,
-            'block2': 1e-4,
-            'block3': 5e-5,
-        },
-        'fixed_epochs': {
-            'block1': 4,
-            'block2': 6,
-            'block3': 8,
-        },
-        'unfreeze_last_epochs': 1,  # Unfreeze all layers for final N epochs
-        'track_gradients': True,  # Log gradient norms for analysis
-        'freeze_batchnorm': False,  # If True, freeze BN layers too; if False, keep them trainable
+        'tta_level': 2,         # the level of test-time augmentation: 0=none, 1=mirror, 2=mirror+translate
     },
 }
 
@@ -79,6 +78,7 @@ def batch_crop(images, crop_size):
     r = (images.size(-1) - crop_size)//2
     shifts = torch.randint(-r, r+1, size=(len(images), 2), device=images.device)
     images_out = torch.empty((len(images), 3, crop_size, crop_size), device=images.device, dtype=images.dtype)
+    # The two cropping methods in this if-else produce equivalent results, but the second is faster for r > 2.
     if r <= 2:
         for sy in range(-r, r+1):
             for sx in range(-r, r+1):
@@ -95,6 +95,7 @@ def batch_crop(images, crop_size):
     return images_out
 
 class CifarLoader:
+
     def __init__(self, path, train=True, batch_size=500, aug=None, drop_last=None, shuffle=None, gpu=0):
         data_path = os.path.join(path, 'train.pt' if train else 'test.pt')
         if not os.path.exists(data_path):
@@ -105,10 +106,11 @@ class CifarLoader:
 
         data = torch.load(data_path, map_location=torch.device(gpu))
         self.images, self.labels, self.classes = data['images'], data['labels'], data['classes']
+        # It's faster to load+process uint8 data than to load preprocessed fp16 data
         self.images = (self.images.half() / 255).permute(0, 3, 1, 2).to(memory_format=torch.channels_last)
 
         self.normalize = T.Normalize(CIFAR_MEAN, CIFAR_STD)
-        self.proc_images = {}
+        self.proc_images = {} # Saved results of image processing to be done on the first epoch
         self.epoch = 0
 
         self.aug = aug or {}
@@ -123,10 +125,13 @@ class CifarLoader:
         return len(self.images)//self.batch_size if self.drop_last else ceil(len(self.images)/self.batch_size)
 
     def __iter__(self):
+
         if self.epoch == 0:
             images = self.proc_images['norm'] = self.normalize(self.images)
+            # Pre-flip images in order to do every-other epoch flipping scheme
             if self.aug.get('flip', False):
                 images = self.proc_images['flip'] = batch_flip_lr(images)
+            # Pre-pad images to save time when doing random translation
             pad = self.aug.get('translate', 0)
             if pad > 0:
                 self.proc_images['pad'] = F.pad(images, (pad,)*4, 'reflect')
@@ -137,6 +142,7 @@ class CifarLoader:
             images = self.proc_images['flip']
         else:
             images = self.proc_images['norm']
+        # Flip all images together every other epoch. This increases diversity relative to random flipping
         if self.aug.get('flip', False):
             if self.epoch % 2 == 1:
                 images = images.flip(-1)
@@ -164,10 +170,12 @@ class Mul(nn.Module):
         return x * self.scale
 
 class BatchNorm(nn.BatchNorm2d):
-    def __init__(self, num_features, momentum, eps=1e-12, weight=False, bias=True):
+    def __init__(self, num_features, momentum, eps=1e-12,
+                 weight=False, bias=True):
         super().__init__(num_features, eps=eps, momentum=1-momentum)
         self.weight.requires_grad = weight
         self.bias.requires_grad = bias
+        # Note that PyTorch already initializes the weights to one and bias to zero
 
 class Conv(nn.Conv2d):
     def __init__(self, in_channels, out_channels, kernel_size=3, padding='same', bias=False):
@@ -181,10 +189,9 @@ class Conv(nn.Conv2d):
         torch.nn.init.dirac_(w[:w.size(1)])
 
 class ConvGroup(nn.Module):
-    def __init__(self, channels_in, channels_out, batchnorm_momentum, block_name=None):
+    def __init__(self, channels_in, channels_out, batchnorm_momentum):
         super().__init__()
-        self.block_name = block_name  # For identifying blocks during freezing
-        self.conv1 = Conv(channels_in, channels_out)
+        self.conv1 = Conv(channels_in,  channels_out)
         self.pool = nn.MaxPool2d(2)
         self.norm1 = BatchNorm(channels_out, batchnorm_momentum)
         self.conv2 = Conv(channels_out, channels_out)
@@ -213,9 +220,9 @@ def make_net():
     net = nn.Sequential(
         Conv(3, whiten_width, whiten_kernel_size, padding=0, bias=True),
         nn.GELU(),
-        ConvGroup(whiten_width, widths['block1'], batchnorm_momentum, block_name='block1'),
-        ConvGroup(widths['block1'], widths['block2'], batchnorm_momentum, block_name='block2'),
-        ConvGroup(widths['block2'], widths['block3'], batchnorm_momentum, block_name='block3'),
+        ConvGroup(whiten_width,     widths['block1'], batchnorm_momentum),
+        ConvGroup(widths['block1'], widths['block2'], batchnorm_momentum),
+        ConvGroup(widths['block2'], widths['block3'], batchnorm_momentum),
         nn.MaxPool2d(3),
         Flatten(),
         nn.Linear(widths['block3'], 10, bias=False),
@@ -265,150 +272,6 @@ class LookaheadState:
                 net_param.copy_(ema_param)
 
 ############################################
-#          Selective Layer Freezing        #
-############################################
-
-class LayerFreezer:
-    def __init__(self, model, freeze_config):
-        self.model = model
-        self.config = freeze_config
-        self.frozen_blocks = set()
-        self.gradient_history = {'block1': [], 'block2': [], 'block3': []}
-        self.freeze_log = []  # Track when blocks are frozen/unfrozen
-        
-        # Get references to the ConvGroup blocks
-        self.blocks = {
-            'block1': model[2],  # First ConvGroup
-            'block2': model[3],  # Second ConvGroup
-            'block3': model[4],  # Third ConvGroup
-        }
-    
-    def compute_block_gradient_norm(self, block):
-        """Compute the L2 norm of gradients for all parameters in a block."""
-        total_norm = 0.0
-        for p in block.parameters():
-            if p.grad is not None and p.requires_grad:
-                param_norm = p.grad.data.norm(2)
-                total_norm += param_norm.item() ** 2
-        return total_norm ** 0.5
-    
-    def track_gradients(self):
-        """Track gradient norms for all blocks."""
-        if not self.config.get('track_gradients', False):
-            return
-        
-        for block_name, block in self.blocks.items():
-            grad_norm = self.compute_block_gradient_norm(block)
-            self.gradient_history[block_name].append(grad_norm)
-    
-    def should_freeze_block(self, block_name, epoch, step):
-        """Determine if a block should be frozen based on the strategy."""
-        if not self.config.get('enabled', False):
-            return False
-        
-        if block_name in self.frozen_blocks:
-            return True
-        
-        strategy = self.config.get('strategy', 'none')
-        
-        if strategy == 'gradient':
-            # Freeze based on gradient threshold
-            if len(self.gradient_history[block_name]) < 10:
-                return False  # Need some history
-            
-            recent_grad_norm = self.gradient_history[block_name][-1]
-            threshold = self.config['gradient_threshold'].get(block_name, 1e-4)
-            
-            return recent_grad_norm < threshold
-        
-        elif strategy == 'fixed':
-            # Freeze based on fixed epoch
-            freeze_epoch = self.config['fixed_epochs'].get(block_name, 999)
-            return epoch >= freeze_epoch
-        
-        elif strategy == 'hybrid':
-            # Use gradient for block1, fixed for others
-            if block_name == 'block1':
-                if len(self.gradient_history[block_name]) < 10:
-                    return False
-                recent_grad_norm = self.gradient_history[block_name][-1]
-                threshold = self.config['gradient_threshold'].get(block_name, 5e-4)
-                return recent_grad_norm < threshold
-            else:
-                freeze_epoch = self.config['fixed_epochs'].get(block_name, 999)
-                return epoch >= freeze_epoch
-        
-        return False
-    
-    def freeze_block(self, block_name, epoch):
-        """Freeze all trainable parameters in a block."""
-        if block_name in self.frozen_blocks:
-            return
-        
-        block = self.blocks[block_name]
-        freeze_bn = self.config.get('freeze_batchnorm', False)
-        
-        for name, param in block.named_parameters():
-            # Always freeze conv weights
-            if 'conv' in name:
-                param.requires_grad = False
-            # Conditionally freeze batchnorm
-            elif freeze_bn:
-                param.requires_grad = False
-        
-        self.frozen_blocks.add(block_name)
-        self.freeze_log.append({
-            'epoch': epoch,
-            'action': 'freeze',
-            'block': block_name,
-            'grad_norm': self.gradient_history[block_name][-1] if self.gradient_history[block_name] else None
-        })
-    
-    def unfreeze_block(self, block_name, epoch):
-        """Unfreeze all parameters in a block."""
-        if block_name not in self.frozen_blocks:
-            return
-        
-        block = self.blocks[block_name]
-        
-        for name, param in block.named_parameters():
-            if 'conv' in name or 'weight' in name or 'bias' in name:
-                param.requires_grad = True
-        
-        self.frozen_blocks.remove(block_name)
-        self.freeze_log.append({
-            'epoch': epoch,
-            'action': 'unfreeze',
-            'block': block_name
-        })
-    
-    def unfreeze_all(self, epoch):
-        """Unfreeze all blocks for final fine-tuning."""
-        for block_name in list(self.frozen_blocks):
-            self.unfreeze_block(block_name, epoch)
-    
-    def update(self, epoch, step, total_epochs):
-        """Update freezing state based on strategy and epoch."""
-        # Check if we should unfreeze for final epochs
-        unfreeze_last = self.config.get('unfreeze_last_epochs', 1)
-        if epoch >= total_epochs - unfreeze_last:
-            self.unfreeze_all(epoch)
-            return
-        
-        # Check each block for freezing
-        for block_name in ['block1', 'block2', 'block3']:
-            if self.should_freeze_block(block_name, epoch, step):
-                self.freeze_block(block_name, epoch)
-    
-    def get_stats(self):
-        """Return statistics about freezing."""
-        return {
-            'frozen_blocks': list(self.frozen_blocks),
-            'gradient_history': self.gradient_history,
-            'freeze_log': self.freeze_log,
-        }
-
-############################################
 #                 Logging                  #
 ############################################
 
@@ -423,8 +286,7 @@ def print_columns(columns_list, is_head=False, is_final_entry=False):
     if is_head or is_final_entry:
         print('-'*len(print_string))
 
-logging_columns_list = ['run   ', 'epoch', 'train_loss', 'train_acc', 'val_acc', 'tta_val_acc', 'frozen', 'total_time_seconds']
-
+logging_columns_list = ['run   ', 'epoch', 'train_loss', 'train_acc', 'val_acc', 'tta_val_acc', 'total_time_seconds']
 def print_training_details(variables, is_final_entry):
     formatted = []
     for col in logging_columns_list:
@@ -444,6 +306,15 @@ def print_training_details(variables, is_final_entry):
 ############################################
 
 def infer(model, loader, tta_level=0):
+
+    # Test-time augmentation strategy (for tta_level=2):
+    # 1. Flip/mirror the image left-to-right (50% of the time).
+    # 2. Translate the image by one pixel either up-and-left or down-and-right (50% of the time,
+    #    i.e. both happen 25% of the time).
+    #
+    # This creates 6 views per image (left/right times the two translations and no-translation),
+    # which we evaluate and then weight according to the given probabilities.
+
     def infer_basic(inputs, net):
         return net(inputs).clone()
 
@@ -478,11 +349,16 @@ def evaluate(model, loader, tta_level=0):
 ############################################
 
 def main(run):
+
     batch_size = hyp['opt']['batch_size']
     epochs = hyp['opt']['train_epochs']
     momentum = hyp['opt']['momentum']
+    # Assuming gradients are constant in time, for Nesterov momentum, the below ratio is how much
+    # larger the default steps will be than the underlying per-example gradients. We divide the
+    # learning rate by this ratio in order to ensure steps are the same scale as gradients, regardless
+    # of the choice of momentum.
     kilostep_scale = 1024 * (1 + 1 / (1 - momentum))
-    lr = hyp['opt']['lr'] / kilostep_scale
+    lr = hyp['opt']['lr'] / kilostep_scale # un-decoupled learning rate for PyTorch SGD
     wd = hyp['opt']['weight_decay'] * batch_size / kilostep_scale
     lr_biases = lr * hyp['opt']['bias_scaler']
 
@@ -490,14 +366,12 @@ def main(run):
     test_loader = CifarLoader('cifar10', train=False, batch_size=2000)
     train_loader = CifarLoader('cifar10', train=True, batch_size=batch_size, aug=hyp['aug'])
     if run == 'warmup':
+        # The only purpose of the first run is to warmup, so we can use dummy data
         train_loader.labels = torch.randint(0, 10, size=(len(train_loader.labels),), device=train_loader.labels.device)
     total_train_steps = ceil(len(train_loader) * epochs)
 
     model = make_net()
     current_steps = 0
-
-    # Initialize layer freezer
-    layer_freezer = LayerFreezer(model, hyp['freeze'])
 
     norm_biases = [p for k, p in model.named_parameters() if 'norm' in k and p.requires_grad]
     other_params = [p for k, p in model.named_parameters() if 'norm' not in k and p.requires_grad]
@@ -519,11 +393,12 @@ def main(run):
     alpha_schedule = 0.95**5 * (torch.arange(total_train_steps+1) / total_train_steps)**3
     lookahead_state = LookaheadState(model)
 
+    # For accurately timing GPU code
     starter = torch.cuda.Event(enable_timing=True)
     ender = torch.cuda.Event(enable_timing=True)
     total_time_seconds = 0.0
 
-    # Initialize whitening layer
+    # Initialize the whitening layer using training images
     starter.record()
     train_images = train_loader.normalize(train_loader.images[:5000])
     init_whitening_conv(model[0], train_images)
@@ -532,6 +407,7 @@ def main(run):
     total_time_seconds += 1e-3 * starter.elapsed_time(ender)
 
     for epoch in range(ceil(epochs)):
+
         model[0].bias.requires_grad = (epoch < hyp['opt']['whiten_bias_epochs'])
 
         ####################
@@ -539,20 +415,14 @@ def main(run):
         ####################
 
         starter.record()
+
         model.train()
-        
         for inputs, labels in train_loader:
+
             outputs = model(inputs)
             loss = loss_fn(outputs, labels).sum()
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            
-            # Track gradients before optimizer step
-            layer_freezer.track_gradients()
-            
-            # Update layer freezing state
-            layer_freezer.update(epoch, current_steps, ceil(epochs))
-            
             optimizer.step()
             scheduler.step()
 
@@ -574,15 +444,12 @@ def main(run):
         #    Evaluation    #
         ####################
 
+        # Save the accuracy and loss from the last training batch of the epoch
         train_acc = (outputs.detach().argmax(1) == labels).float().mean().item()
         train_loss = loss.item() / batch_size
         val_acc = evaluate(model, test_loader, tta_level=0)
-        
-        # Get frozen blocks for logging
-        frozen = ','.join(layer_freezer.frozen_blocks) if layer_freezer.frozen_blocks else 'none'
-        
         print_training_details(locals(), is_final_entry=False)
-        run = None
+        run = None # Only print the run number once
 
     ####################
     #  TTA Evaluation  #
@@ -595,13 +462,9 @@ def main(run):
     total_time_seconds += 1e-3 * starter.elapsed_time(ender)
 
     epoch = 'eval'
-    frozen = 'final'
     print_training_details(locals(), is_final_entry=True)
 
-    # Save freezing statistics
-    freezer_stats = layer_freezer.get_stats()
-    
-    return tta_val_acc, total_time_seconds, freezer_stats
+    return tta_val_acc
 
 if __name__ == "__main__":
     with open(sys.argv[0]) as f:
@@ -609,34 +472,13 @@ if __name__ == "__main__":
 
     print_columns(logging_columns_list, is_head=True)
     #main('warmup')
-    
-    results = [main(run) for run in range(25)]
-    accs = torch.tensor([r[0] for r in results])
-    times = torch.tensor([r[1] for r in results])
-    
-    print('\n=== Results Summary ===')
-    print('Accuracy - Mean: %.4f    Std: %.4f' % (accs.mean(), accs.std()))
-    print('Time - Mean: %.4f    Std: %.4f' % (times.mean(), times.std()))
-    
-    # Save detailed logs
-    log = {
-        'code': code,
-        'accs': accs,
-        'times': times,
-        'hyperparameters': hyp,
-        'freezer_stats': [r[2] for r in results],
-    }
+    accs = torch.tensor([main(run) for run in range(25)])
+    print('Mean: %.4f    Std: %.4f' % (accs.mean(), accs.std()))
+
+    log = {'code': code, 'accs': accs}
     log_dir = os.path.join('logs', str(uuid.uuid4()))
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, 'log.pt')
     print(os.path.abspath(log_path))
-    torch.save(log, log_path)
-    
-    # Save gradient history for visualization
-    if hyp['freeze']['track_gradients']:
-        print('\nSample gradient norms per block:')
-        sample_stats = results[0][2]
-        for block_name in ['block1', 'block2', 'block3']:
-            grad_hist = sample_stats['gradient_history'][block_name]
-            if grad_hist:
-                print(f'{block_name}: min={min(grad_hist):.2e}, max={max(grad_hist):.2e}, final={grad_hist[-1]:.2e}')
+    torch.save(log, os.path.join(log_dir, 'log.pt'))
+
