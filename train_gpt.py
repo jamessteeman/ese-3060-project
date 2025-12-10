@@ -308,12 +308,12 @@ class Hyperparameters:
     input_bin : str = 'fineweb10B/fineweb_train_*.bin'  #remove data/
     input_val_bin : str = 'fineweb10B/fineweb_val_*.bin'   #remove data/
     # optimization hyperparams
-    batch_size : int = 256  # target/max batch size
-    min_batch_size : int = 256  # minimum batch size for warmup
+    batch_size : int = 1024  # target/max batch size
+    min_batch_size : int = 1024  # minimum batch size for warmup
     batch_size_warmup_iters : int = 0  # iterations to warmup batch size
-    device_batch_size : int = 64  # per-GPU batch size
+    device_batch_size : int = 128  # per-GPU batch size
     sequence_length : int = 1024
-    num_iterations : int = 5100
+    num_iterations : int = 2550
     learning_rate : float = 0.0036
     warmup_iters : int = 0
     warmdown_iters : int = 1450
