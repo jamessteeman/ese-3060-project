@@ -268,36 +268,41 @@ class DistributedDataLoader:
         return x.cuda(), y.cuda()
 
 # -----------------------------------------------------------------------------
-# Dynamic Batch Size Scheduling - FIXED VERSION
+# Stepped Batch Size Schedule
 
-def get_batch_size_schedule(step, warmup_iters, min_batch_size, max_batch_size, quantum):
-    """
-    Progressive batch size warmup with proper quantization.
+# Format: (start_iteration, device_batch_size)
+# batch_size is calculated as 8 × device_batch_size (1 accumulation alwasys)
+BATCH_SIZE_SCHEDULE = [
+    (0, 32),       # Steps 0-1499: device_batch=32, batch=256
+    (1500, 128),   # Steps 1500-2499: device_batch=128, batch=1024
+    (2500, 32),    # Steps 2500+: device_batch=32, batch256
+]
+
+def get_batch_config_for_step(step, schedule, num_gpus=8):
+    #"""
+    #Get device_batch_size and batch_size for current step based on schedule.
     
-    Args:
-        step: Current training step
-        warmup_iters: Number of iterations to warmup over
-        min_batch_size: Starting batch size (must be multiple of quantum)
-        max_batch_size: Ending batch size (must be multiple of quantum)
-        quantum: Batch size must be multiple of this (device_batch_size × num_gpus)
+    #Args:
+    #    step: Current training step
+    #    schedule: List of (start_iteration, device_batch_size) tuples
+    #    num_gpus: Number of GPUs (default 8)
     
-    Returns:
-        Valid batch size (always a multiple of quantum)
-    """
-    if step >= warmup_iters:
-        return max_batch_size
+    #Returns:
+    #    (device_batch_size, batch_size, quantum) tuple
+    #"""
+    # Find the appropriate schedule entry
+    device_batch_size = schedule[0][1]  # Default to first entry
     
-    # Linear interpolation
-    progress = step / warmup_iters
-    raw_batch_size = min_batch_size + progress * (max_batch_size - min_batch_size)
+    for start_iter, dbs in schedule:
+        if step >= start_iter:
+            device_batch_size = dbs
+        else:
+            break
     
-    # Quantize to nearest valid batch size (multiple of quantum)
-    quantized_batch_size = int(round(raw_batch_size / quantum)) * quantum
+    batch_size = device_batch_size * num_gpus
+    quantum = device_batch_size * num_gpus
     
-    # Clamp to valid range
-    quantized_batch_size = max(min_batch_size, min(quantized_batch_size, max_batch_size))
-    
-    return quantized_batch_size
+    return device_batch_size, batch_size, quantum
 
 # -----------------------------------------------------------------------------
 # int main
@@ -305,15 +310,11 @@ def get_batch_size_schedule(step, warmup_iters, min_batch_size, max_batch_size, 
 @dataclass
 class Hyperparameters:
     # data hyperparams
-    input_bin : str = 'fineweb10B/fineweb_train_*.bin'  #remove data/
-    input_val_bin : str = 'fineweb10B/fineweb_val_*.bin'   #remove data/
-    # optimization hyperparams
-    batch_size : int = 1024  # target/max batch size
-    min_batch_size : int = 1024  # minimum batch size for warmup
-    batch_size_warmup_iters : int = 0  # iterations to warmup batch size
-    device_batch_size : int = 128  # per-GPU batch size
+    input_bin : str = 'fineweb10B/fineweb_train_*.bin'
+    input_val_bin : str = 'fineweb10B/fineweb_val_*.bin'
+    # optimization hyperparams - THESE ARE OVERRIDDEN BY BATCH_SIZE_SCHEDULE
     sequence_length : int = 1024
-    num_iterations : int = 2550
+    num_iterations : int = 4500 #total number of iterations (when does it end.
     learning_rate : float = 0.0036
     warmup_iters : int = 0
     warmdown_iters : int = 1450
@@ -335,31 +336,45 @@ torch.cuda.set_device(device)
 print(f"using device: {device}")
 master_process = (ddp_rank == 0)
 
-# convenience variables
-B, T = args.device_batch_size, args.sequence_length
-batch_quantum = B * ddp_world_size  # All batch sizes must be multiples of this
+T = args.sequence_length
 
-# calculate validation steps
-assert args.val_tokens % (B * T * ddp_world_size) == 0
-val_steps = args.val_tokens // (B * T * ddp_world_size)
-
-# calculate gradient accumulation bounds
-assert args.batch_size % batch_quantum == 0
-assert args.min_batch_size % batch_quantum == 0
-max_train_accumulation_steps = args.batch_size // batch_quantum
-min_train_accumulation_steps = args.min_batch_size // batch_quantum
-
+# Validate and print schedule
 if master_process:
-    print(f"Batch size schedule: {args.min_batch_size} -> {args.batch_size} over {args.batch_size_warmup_iters} iterations")
-    print(f"Gradient accumulation steps: {min_train_accumulation_steps} -> {max_train_accumulation_steps}")
-    print(f"Batch quantum (divisibility requirement): {batch_quantum}")
+    print("="*80)
+    print("BATCH SIZE SCHEDULE:")
+    print("="*80)
+    for i, (start_iter, dbs) in enumerate(BATCH_SIZE_SCHEDULE):
+        bs = dbs * ddp_world_size
+        accum = bs // (dbs * ddp_world_size)
+        end_iter = BATCH_SIZE_SCHEDULE[i+1][0] - 1 if i+1 < len(BATCH_SIZE_SCHEDULE) else args.num_iterations
+        print(f"Steps {start_iter:>5} - {end_iter:>5}: device_batch={dbs:>3}, batch_size={bs:>4}, accum_steps={accum}")
+    print("="*80)
+    print()
 
-# load tokens
-train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
-val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
+# Get initial batch configuration
+initial_device_batch, initial_batch_size, initial_quantum = get_batch_config_for_step(0, BATCH_SIZE_SCHEDULE, ddp_world_size)
+
+# Validate all schedule entries
+for start_iter, dbs in BATCH_SIZE_SCHEDULE:
+    bs = dbs * ddp_world_size
+    quantum = dbs * ddp_world_size
+    assert bs % quantum == 0, f"batch_size {bs} must be divisible by quantum {quantum} at iteration {start_iter}"
+
+# Calculate validation steps (using maximum device_batch_size from schedule)
+max_device_batch = max(dbs for _, dbs in BATCH_SIZE_SCHEDULE)
+assert args.val_tokens % (max_device_batch * T * ddp_world_size) == 0, \
+    f"val_tokens must be divisible by max_device_batch*T*ddp_world_size ({max_device_batch * T * ddp_world_size})"
+val_steps = args.val_tokens // (max_device_batch * T * ddp_world_size)
+
+# load tokens - we'll recreate the loader when batch size changes
+current_device_batch = initial_device_batch
+train_loader = DistributedDataLoader(args.input_bin, current_device_batch, T, ddp_rank, ddp_world_size)
+val_loader = DistributedDataLoader(args.input_val_bin, max_device_batch, T, ddp_rank, ddp_world_size)
+
 if master_process:
     print(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
     print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
+
 x, y = train_loader.next_batch()
 
 num_vocab = 50304
@@ -414,6 +429,18 @@ train_loader.reset()
 for step in range(args.num_iterations + 1):
     last_step = (step == args.num_iterations)
     
+    # Check if we need to update batch size at this step
+    device_batch_size, batch_size, batch_quantum = get_batch_config_for_step(step, BATCH_SIZE_SCHEDULE, ddp_world_size)
+    
+    # Recreate train_loader if device_batch_size changed
+    if device_batch_size != current_device_batch:
+        if master_process:
+            print(f"\n>>> BATCH SIZE CHANGE at step {step}: device_batch {current_device_batch} -> {device_batch_size}, batch_size {current_device_batch * ddp_world_size} -> {batch_size}\n")
+        current_device_batch = device_batch_size
+        # Recreate data loader with new batch size
+        train_loader = DistributedDataLoader(args.input_bin, device_batch_size, T, ddp_rank, ddp_world_size)
+        x, y = train_loader.next_batch()
+    
     if step == 10:
         training_time_ms = 0
         t0 = time.time()
@@ -435,11 +462,9 @@ for step in range(args.num_iterations + 1):
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
         if master_process:
-            current_bs = get_batch_size_schedule(step, args.batch_size_warmup_iters, 
-                                                  args.min_batch_size, args.batch_size, batch_quantum)
-            print(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms batch_size:{current_bs}')
+            print(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms batch_size:{batch_size}')
             with open(logfile, "a") as f:
-                f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms batch_size:{current_bs}\n')
+                f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms batch_size:{batch_size}\n')
         torch.cuda.synchronize()
         t0 = time.time()
 
@@ -457,10 +482,8 @@ for step in range(args.num_iterations + 1):
     # --------------- TRAINING SECTION BEGIN -----------------
     model.train()
     
-    # Dynamic batch size: compute current gradient accumulation steps
-    current_batch_size = get_batch_size_schedule(step, args.batch_size_warmup_iters, 
-                                                  args.min_batch_size, args.batch_size, batch_quantum)
-    train_accumulation_steps = current_batch_size // batch_quantum
+    # Calculate gradient accumulation steps
+    train_accumulation_steps = batch_size // batch_quantum
     
     for i in range(1, train_accumulation_steps+1):
         with ctx:
@@ -485,9 +508,9 @@ for step in range(args.num_iterations + 1):
 
     if master_process:
         approx_time = training_time_ms + 1000 * (time.time() - t0)
-        print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms batch_size:{current_batch_size}")
+        print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms batch_size:{batch_size}")
         with open(logfile, "a") as f:
-            f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms batch_size:{current_batch_size}\n")
+            f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms batch_size:{batch_size}\n")
 
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
