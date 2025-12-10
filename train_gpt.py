@@ -274,8 +274,8 @@ class DistributedDataLoader:
 # batch_size is calculated as 8 × device_batch_size (1 accumulation alwasys)
 BATCH_SIZE_SCHEDULE = [
     (0, 32),       # Steps 0-1499: device_batch=32, batch=256
-    (1500, 128),   # Steps 1500-2499: device_batch=128, batch=1024
-    (2500, 32),    # Steps 2500+: device_batch=32, batch256
+    (2000, 64),   # Steps 1500-2499: device_batch=128, batch=1024
+    (3000, 128),    # Steps 2500+: device_batch=32, batch256
 ]
 
 def get_batch_config_for_step(step, schedule, num_gpus=8):
@@ -314,7 +314,7 @@ class Hyperparameters:
     input_val_bin : str = 'fineweb10B/fineweb_val_*.bin'
     # optimization hyperparams - THESE ARE OVERRIDDEN BY BATCH_SIZE_SCHEDULE
     sequence_length : int = 1024
-    num_iterations : int = 4500 #total number of iterations (when does it end.
+    num_iterations : int = 5000 #total number of iterations (when does it end.
     learning_rate : float = 0.0036
     warmup_iters : int = 0
     warmdown_iters : int = 1450
